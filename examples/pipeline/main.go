@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"github.com/Pushwoosh/go-connection-pool/pkg/connection"
 	"github.com/Pushwoosh/go-connection-pool/pkg/message"
 	"github.com/Pushwoosh/go-connection-pool/pkg/pool"
+	rateLimit "github.com/Pushwoosh/go-connection-pool/pkg/rate-limiter"
 )
 
 const defaultTime = time.Second * 5
@@ -25,10 +27,10 @@ type msg struct {
 type NameGenerator func() string
 
 func ConcreteNameGenerator(namesList []string) NameGenerator {
-	len := len(namesList) - 1
+	l := len(namesList) - 1
 	return func() string {
 		// nolint: gosec
-		return namesList[rand.Int()%len]
+		return namesList[rand.Int()%l]
 	}
 }
 
@@ -91,6 +93,17 @@ func (c *conn) Serve(in chan message.Message, out chan message.Message) {
 		}
 		if resp, err := c.realConn.Get(m.Destination); err != nil || resp.StatusCode != 200 {
 			m.Status = "FAIL"
+			if err != nil {
+				log.Printf("%s fail with err: %+v\n", m.Destination, err)
+			} else {
+				_, err := ioutil.ReadAll(resp.Body)
+				if err != nil {
+					log.Printf("%s fail with: %d <%+v>\n", m.Destination, resp.StatusCode, err)
+				} else {
+					log.Printf("%s fail with: %d\n", m.Destination, resp.StatusCode)
+				}
+			}
+
 		} else {
 			m.Status = "OK"
 		}
@@ -124,13 +137,17 @@ func poolConnectionDialer() connection.Dialer {
 type StatsReporter struct{}
 
 func (s *StatsReporter) Serve(in chan message.Message, out chan message.Message) {
+	counter := 0
+	startTime := time.Now().Unix()
 	for untypedM := range in {
 		m, ok := untypedM.(msg)
 		if !ok {
 			continue
 		}
-		log.Printf("%s: %s\n", m.TemplatedData, m.Status)
+		counter++
+		log.Printf("%d) %s: %s\n", counter, m.TemplatedData, m.Status)
 	}
+	log.Printf("Complete with rate: %f\n", float64(counter)/float64(time.Now().Unix()-startTime))
 	out <- msg{}
 }
 
@@ -142,13 +159,17 @@ func main() {
 	msgGenerator := ConcreteMgsGenerator(nameGenerator)
 
 	rabbit := &FakeRabbitMQDataProvider{
-		FakeMsgNum:   5,
+		FakeMsgNum:   10,
 		MsgGenerator: msgGenerator,
 	}
+	rateLimiter := rateLimit.NewRateLimiter(rateLimit.Config{
+		Rate:     1,
+		WaitTime: 500 * time.Millisecond,
+	})
 	additionalDataProvider := &AdditionalDataProvider{
 		NameGenerator: nameGenerator,
 	}
-	pool := pool.NewPool(pool.Config{
+	connPool := pool.NewPool(pool.Config{
 		MaxConnections: 5,
 		CheckInterval:  defaultTime,
 		Dialer:         poolConnectionDialer(),
@@ -157,13 +178,15 @@ func main() {
 
 	inRabbitCh := make(chan message.Message)
 	outRabbitCh := make(chan message.Message)
+	outRateLimiterCh := make(chan message.Message)
 	outAdditionalDataProviderCh := make(chan message.Message)
 	outPoolCh := make(chan message.Message)
 	statsOutCh := make(chan message.Message)
 
 	go rabbit.Serve(inRabbitCh, outRabbitCh)
-	go additionalDataProvider.Serve(outRabbitCh, outAdditionalDataProviderCh)
-	go func() { _ = pool.Serve(outAdditionalDataProviderCh, outPoolCh); close(outPoolCh) }()
+	go func() { _ = rateLimiter.Serve(outRabbitCh, outRateLimiterCh); close(outPoolCh) }()
+	go additionalDataProvider.Serve(outRateLimiterCh, outAdditionalDataProviderCh)
+	go func() { _ = connPool.Serve(outAdditionalDataProviderCh, outPoolCh); close(outPoolCh) }()
 	go stats.Serve(outPoolCh, statsOutCh)
 
 	inRabbitCh <- msg{}

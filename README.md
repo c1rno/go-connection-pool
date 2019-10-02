@@ -18,10 +18,7 @@ So to start you need implement your own:
 
 and you are ready to download all internet:
 ```go
-go func() {
-    _ = p.Serve(inChan, outChan)
-    close(outChan)
-}()
+go func() { _ = connPool.Serve(outAdditionalDataProviderCh, outPoolCh); close(outPoolCh) }()
 ```
 
 ### Benchmarks
@@ -75,3 +72,8 @@ sys     0m0.610s
 ```
 
 The difference is obvious.
+
+### Rate limiting
+
+Now it is supported by [RateLimiter](./pkg/rate-limiter/implementation.go),
+ see examples [here](./examples/pipeline/main.go)
